@@ -101,10 +101,33 @@ def test_parse_args_default_action():
     )
 
     assert parser.action == action
-    assert parser.user_pip == user_pip
+    assert parser.user_pip == [user_pip]
     assert parser.user_bindep == user_bindep
     assert parser.write_pip == write_pip
     assert parser.write_bindep == write_bindep
+
+
+def test_parse_args_multiple_user_pip():
+    parser = parse_args(
+        [
+            'introspect',
+            '--user-pip=/tmp/user-pip-1.txt',
+            '--user-pip=/tmp/user-pip-2.txt',
+        ]
+    )
+
+    assert parser.user_pip == ['/tmp/user-pip-1.txt', '/tmp/user-pip-2.txt']
+
+
+def test_process_combines_multiple_user_pip_files(data_dir, tmp_path):
+    first_user_file = tmp_path / 'requirements-1.txt'
+    second_user_file = tmp_path / 'requirements-2.txt'
+    first_user_file.write_text("ansible\n\n# comment\n")
+    second_user_file.write_text("pytest\nrequests>=2\n")
+
+    retval = process(data_dir=data_dir, user_pip=[str(first_user_file), str(second_user_file)])
+
+    assert retval['python']['user'] == ['ansible', 'pytest', 'requests>=2']
 
 
 def test_yaml_extension(data_dir):
