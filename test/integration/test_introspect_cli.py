@@ -39,6 +39,25 @@ def test_introspect_with_user_reqs(cli, data_dir, tmp_path):
     assert 'pytest  # from collection user' in pip_data
 
 
+def test_introspect_with_multiple_user_pip_files(cli, data_dir, tmp_path):
+    first_user_file = tmp_path / 'requirements-1.txt'
+    second_user_file = tmp_path / 'requirements-2.txt'
+    first_user_file.write_text("ansible\n")
+    second_user_file.write_text("pytest\nrequests>=2\n")
+    pip_out = tmp_path / 'pip-output.txt'
+
+    cli(
+        f'ansible-builder introspect --user-pip={first_user_file} '
+        f'--user-pip={second_user_file} --write-pip={pip_out} {data_dir}'
+    )
+
+    pip_data = pip_out.read_text()
+    assert 'pytz  # from collection test.reqfile' in pip_data
+    assert 'ansible  # from collection user' in pip_data
+    assert 'pytest  # from collection user' in pip_data
+    assert 'requests>=2  # from collection user' in pip_data
+
+
 def test_introspect_exclude_python(cli, data_dir, tmp_path):
     exclude_file = tmp_path / 'exclude.txt'
     exclude_file.write_text("pytz\npython-dateutil\n")
