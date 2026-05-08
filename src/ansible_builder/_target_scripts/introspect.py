@@ -216,7 +216,10 @@ def process(*,
 
     # add on entries from user files, if they are given
     if user_pip:
-        col_pip_lines = pip_file_data(user_pip)
+        user_pip_files = [user_pip] if isinstance(user_pip, str) else user_pip
+        col_pip_lines = []
+        for user_pip_file in user_pip_files:
+            col_pip_lines.extend(pip_file_data(user_pip_file))
         if col_pip_lines:
             py_req['user'] = col_pip_lines
     if exclude_pip:
@@ -446,7 +449,7 @@ def create_introspect_parser(parser):
     )
 
     introspect_parser.add_argument(
-        '--user-pip', dest='user_pip',
+        '--user-pip', dest='user_pip', action='append',
         help='An additional file to combine with collection pip requirements.'
     )
     introspect_parser.add_argument(
