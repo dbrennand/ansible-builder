@@ -1,11 +1,20 @@
+import json
+import logging
 import os
+import subprocess
+import sys
 import pytest
 
-from ansible_builder._target_scripts.introspect import (parse_args,
+from ansible_builder._target_scripts.introspect import (PythonDependencyResolutionError,
+                                                        extract_transitive_python_dependencies,
+                                                        parse_args,
                                                         process,
                                                         process_collection,
                                                         filter_requirements,
-                                                        strip_comments)
+                                                        resolve_python_dependencies,
+                                                        run_introspect,
+                                                        strip_comments,
+                                                        write_python_dependency_outputs)
 
 
 def test_multiple_collection_metadata(data_dir):
@@ -89,6 +98,8 @@ def test_parse_args_default_action():
     user_bindep = '/tmp/user-bindep.txt'
     write_pip = '/tmp/write-pip.txt'
     write_bindep = '/tmp/write-bindep.txt'
+    write_report = '/tmp/python-dependencies.json'
+    write_transitive = '/tmp/transitive-requirements.txt'
 
     parser = parse_args(
         [
@@ -97,6 +108,8 @@ def test_parse_args_default_action():
             f'--user-bindep={user_bindep}',
             f'--write-pip={write_pip}',
             f'--write-bindep={write_bindep}',
+            f'--write-python-dependency-report={write_report}',
+            f'--write-transitive-python={write_transitive}',
         ]
     )
 
@@ -105,6 +118,15 @@ def test_parse_args_default_action():
     assert parser.user_bindep == user_bindep
     assert parser.write_pip == write_pip
     assert parser.write_bindep == write_bindep
+    assert parser.write_python_dependency_report == write_report
+    assert parser.write_transitive_python == write_transitive
+
+
+def test_parse_args_dependency_outputs_default_to_none():
+    parser = parse_args(['introspect'])
+
+    assert parser.write_python_dependency_report is None
+    assert parser.write_transitive_python is None
 
 
 def test_yaml_extension(data_dir):
@@ -426,3 +448,209 @@ def test_collection_regex_exclusions():
     ]
 
     assert filter_requirements(reqs, exclude_collections=excluded_collections) == expected
+
+
+def test_resolve_python_dependencies_constructs_pip_command(mocker, tmp_path):
+    report_path = tmp_path / 'nested' / 'report.json'
+    requirements = [
+        'example[extra]>=1  # from collection example.collection',
+        '--no-index',
+    ]
+    captured_requirements = None
+
+    def pip_run(command, **_kwargs):
+        nonlocal captured_requirements
+        requirements_path = command[command.index('--requirement') + 1]
+        with open(requirements_path, encoding='utf-8') as requirements_file:
+            captured_requirements = requirements_file.read()
+        generated_report = command[command.index('--report') + 1]
+        with open(generated_report, 'w', encoding='utf-8') as report_file:
+            json.dump({'install': []}, report_file)
+
+    run = mocker.patch('ansible_builder._target_scripts.introspect.subprocess.run', side_effect=pip_run)
+
+    resolve_python_dependencies(requirements, report_path=str(report_path))
+
+    command = run.call_args.args[0]
+    assert command[:4] == [sys.executable, '-m', 'pip', 'install']
+    assert '--dry-run' in command
+    assert '--ignore-installed' in command
+    assert '--report' in command
+    assert '--requirement' in command
+    assert run.call_args.kwargs == {
+        'check': True,
+        'text': True,
+        'capture_output': True,
+        'shell': False,
+    }
+    assert captured_requirements == '\n'.join(requirements + [''])
+    assert report_path.is_file()
+
+
+def test_resolve_python_dependencies_preserves_report_bytes(mocker, tmp_path):
+    report_path = tmp_path / 'report.json'
+    original_report = b'{\n  "pip_version": "23.0",\n  "version": "1",\n  "install": []\n}\n'
+
+    def pip_run(command, **_kwargs):
+        generated_report = command[command.index('--report') + 1]
+        with open(generated_report, 'wb') as report_file:
+            report_file.write(original_report)
+
+    mocker.patch('ansible_builder._target_scripts.introspect.subprocess.run', side_effect=pip_run)
+
+    resolve_python_dependencies([], report_path=str(report_path))
+
+    assert report_path.read_bytes() == original_report
+
+
+def test_resolve_python_dependencies_reports_pip_failure_and_cleans_up(mocker, tmp_path):
+    report_path = tmp_path / 'report.json'
+    temporary_paths = []
+
+    def pip_run(command, **_kwargs):
+        temporary_paths.extend([
+            command[command.index('--requirement') + 1],
+            command[command.index('--report') + 1],
+        ])
+        raise subprocess.CalledProcessError(2, command, stderr='No matching distribution found')
+
+    mocker.patch('ansible_builder._target_scripts.introspect.subprocess.run', side_effect=pip_run)
+
+    with pytest.raises(PythonDependencyResolutionError, match='pip exit code 2') as exc_info:
+        resolve_python_dependencies(['missing-package'], report_path=str(report_path))
+
+    assert 'No matching distribution found' in str(exc_info.value)
+    assert not report_path.exists()
+    assert all(not os.path.exists(path) for path in temporary_paths)
+
+
+def test_extract_transitive_python_dependencies(data_dir):
+    report_path = data_dir / 'pip_reports' / 'basic.json'
+
+    assert extract_transitive_python_dependencies(str(report_path)) == [
+        'alpha-package',
+        'zoo-package',
+    ]
+
+
+@pytest.mark.parametrize(('report', 'message'), [
+    ([], 'top-level value must be an object'),
+    ({}, "'install' must be a list"),
+    ({'install': {}}, "'install' must be a list"),
+    ({'install': [None]}, 'install entry 1 must be an object'),
+    ({'install': [{}]}, "lacks valid 'metadata'"),
+    ({'install': [{'metadata': {}, 'requested': False}]}, "lacks a valid 'metadata.name'"),
+    ({'install': [{'metadata': {'name': 'invalid name'}, 'requested': False}]},
+     "lacks a valid 'metadata.name'"),
+    ({'install': [{'metadata': {'name': 'example'}, 'requested': None}]}, "invalid 'requested' value"),
+])
+def test_extract_transitive_python_dependencies_rejects_invalid_reports(tmp_path, report, message):
+    report_path = tmp_path / 'report.json'
+    report_path.write_text(json.dumps(report))
+
+    with pytest.raises(PythonDependencyResolutionError, match=message):
+        extract_transitive_python_dependencies(str(report_path))
+
+
+def test_extract_transitive_python_dependencies_rejects_invalid_json(tmp_path):
+    report_path = tmp_path / 'report.json'
+    report_path.write_text('{')
+
+    with pytest.raises(PythonDependencyResolutionError, match='Unable to read pip installation report'):
+        extract_transitive_python_dependencies(str(report_path))
+
+
+@pytest.mark.parametrize(('report_requested', 'transitive_requested'), [
+    (True, False),
+    (False, True),
+    (True, True),
+])
+def test_write_python_dependency_outputs_resolves_once(mocker, tmp_path, report_requested, transitive_requested):
+    report_path = str(tmp_path / 'report.json') if report_requested else None
+    transitive_path = str(tmp_path / 'transitive.txt') if transitive_requested else None
+
+    def resolve(_requirements, *, report_path):
+        with open(report_path, 'w', encoding='utf-8') as report_file:
+            json.dump({
+                'install': [
+                    {'requested': True, 'metadata': {'name': 'direct'}},
+                    {'requested': False, 'metadata': {'name': 'Transitive_Dependency'}},
+                ],
+            }, report_file)
+
+    resolver = mocker.patch(
+        'ansible_builder._target_scripts.introspect.resolve_python_dependencies',
+        side_effect=resolve,
+    )
+
+    write_python_dependency_outputs(
+        ['direct'],
+        report_path=report_path,
+        transitive_path=transitive_path,
+    )
+
+    resolver.assert_called_once()
+    if transitive_path:
+        with open(transitive_path, encoding='utf-8') as transitive_file:
+            assert transitive_file.read() == 'transitive-dependency\n'
+
+
+def test_write_python_dependency_outputs_writes_empty_transitive_file(mocker, tmp_path):
+    transitive_path = tmp_path / 'transitive.txt'
+
+    def resolve(_requirements, *, report_path):
+        with open(report_path, 'w', encoding='utf-8') as report_file:
+            json.dump({'install': []}, report_file)
+
+    mocker.patch(
+        'ansible_builder._target_scripts.introspect.resolve_python_dependencies',
+        side_effect=resolve,
+    )
+
+    write_python_dependency_outputs([], report_path=None, transitive_path=str(transitive_path))
+
+    assert transitive_path.read_text() == ''
+
+
+def test_run_introspect_dependency_outputs_preserve_existing_output(mocker, tmp_path, capsys):
+    dependency_data = {
+        'python': {'example.collection': ['direct-package>=1']},
+        'system': {'example.collection': ['system-package [platform:rpm]']},
+    }
+
+    def process_data(**_kwargs):
+        return {
+            dependency_type: {source: requirements.copy() for source, requirements in sources.items()}
+            for dependency_type, sources in dependency_data.items()
+        }
+
+    mocker.patch('ansible_builder._target_scripts.introspect.process', side_effect=process_data)
+    dependency_outputs = mocker.patch('ansible_builder._target_scripts.introspect.write_python_dependency_outputs')
+
+    original_pip = tmp_path / 'original-pip.txt'
+    original_args = parse_args(['introspect', f'--write-pip={original_pip}'])
+    with pytest.raises(SystemExit, match='0'):
+        run_introspect(original_args, logging.getLogger(__name__))
+    original_stdout = capsys.readouterr().out
+    dependency_outputs.assert_not_called()
+
+    resolved_pip = tmp_path / 'resolved-pip.txt'
+    report_path = tmp_path / 'report.json'
+    transitive_path = tmp_path / 'transitive.txt'
+    resolved_args = parse_args([
+        'introspect',
+        f'--write-pip={resolved_pip}',
+        f'--write-python-dependency-report={report_path}',
+        f'--write-transitive-python={transitive_path}',
+    ])
+    with pytest.raises(SystemExit, match='0'):
+        run_introspect(resolved_args, logging.getLogger(__name__))
+    resolved_stdout = capsys.readouterr().out
+
+    assert resolved_stdout == original_stdout
+    assert resolved_pip.read_bytes() == original_pip.read_bytes()
+    dependency_outputs.assert_called_once_with(
+        ['direct-package>=1  # from collection example.collection'],
+        report_path=str(report_path),
+        transitive_path=str(transitive_path),
+    )

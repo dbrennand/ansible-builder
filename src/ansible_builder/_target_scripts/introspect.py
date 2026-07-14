@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import yaml
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 
 BASE_COLLECTIONS_PATH = '/usr/share/ansible/collections'
@@ -15,6 +19,9 @@ BASE_COLLECTIONS_PATH = '/usr/share/ansible/collections'
 
 # regex for a comment at the start of a line, or embedded with leading space(s)
 COMMENT_RE = re.compile(r'(?:^|\s+)#.*$')
+
+
+PACKAGE_NAME_RE = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$')
 
 
 EXCLUDE_REQUIREMENTS = frozenset((
@@ -31,6 +38,10 @@ EXCLUDE_REQUIREMENTS = frozenset((
 
 
 logger = logging.getLogger(__name__)
+
+
+class PythonDependencyResolutionError(RuntimeError):
+    """Raised when pip dependency resolution or report processing fails."""
 
 
 class CollectionDefinition:
@@ -421,6 +432,17 @@ def run_introspect(args, log):
     if args.write_bindep and data.get('system'):
         write_file(args.write_bindep, data.get('system') + [''])
 
+    if args.write_python_dependency_report or args.write_transitive_python:
+        try:
+            write_python_dependency_outputs(
+                data.get('python', []),
+                report_path=args.write_python_dependency_report,
+                transitive_path=args.write_transitive_python,
+            )
+        except (OSError, PythonDependencyResolutionError) as exc:
+            log.error('%s', exc)
+            sys.exit(1)
+
     sys.exit(0)
 
 
@@ -473,15 +495,39 @@ def create_introspect_parser(parser):
         '--write-bindep', dest='write_bindep',
         help='Write the combined bindep requirements file to this location.'
     )
+    introspect_parser.add_argument(
+        '--write-python-dependency-report',
+        dest='write_python_dependency_report',
+        metavar='FILE',
+        help=(
+            'Resolve the discovered Python requirements and write the '
+            'unmodified pip installation report JSON to this location. '
+            'Resolution may access configured package indexes or VCS sources.'
+        ),
+    )
+    introspect_parser.add_argument(
+        '--write-transitive-python',
+        dest='write_transitive_python',
+        metavar='FILE',
+        help=(
+            'Resolve the discovered Python requirements and write only '
+            'canonicalized transitive Python package names to this location. '
+            'Resolution may access configured package indexes or VCS sources.'
+        ),
+    )
 
     return introspect_parser
 
 
-def write_file(filename: str, lines: list) -> bool:
+def ensure_parent_directory(filename: str) -> None:
     parent_dir = os.path.dirname(filename)
     if parent_dir and not os.path.exists(parent_dir):
         logger.warning('Creating parent directory for %s', filename)
         os.makedirs(parent_dir)
+
+
+def write_file(filename: str, lines: list) -> bool:
+    ensure_parent_directory(filename)
     new_text = '\n'.join(lines)
     if os.path.exists(filename):
         with open(filename, 'r') as f:
@@ -492,6 +538,129 @@ def write_file(filename: str, lines: list) -> bool:
     with open(filename, 'w') as f:
         f.write(new_text)
     return True
+
+
+def resolve_python_dependencies(requirements: list[str], *, report_path: str) -> None:
+    """Resolve requirements with pip and atomically preserve its report bytes."""
+    ensure_parent_directory(report_path)
+    report_dir = os.path.dirname(os.path.abspath(report_path))
+    requirements_filename = None
+    temporary_report = None
+
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt', delete=False) as requirements_file:
+            requirements_filename = requirements_file.name
+            requirements_file.write('\n'.join(requirements + ['']) if requirements else '')
+
+        with tempfile.NamedTemporaryFile(dir=report_dir, suffix='.json', delete=False) as report_file:
+            temporary_report = report_file.name
+
+        command = [
+            sys.executable,
+            '-m',
+            'pip',
+            'install',
+            '--dry-run',
+            '--ignore-installed',
+            '--report',
+            temporary_report,
+            '--requirement',
+            requirements_filename,
+        ]
+        subprocess.run(command, check=True, text=True, capture_output=True, shell=False)
+
+        if not os.path.isfile(temporary_report):
+            raise PythonDependencyResolutionError(
+                'Transitive Python dependency resolution failed: pip did not create an installation report.'
+            )
+
+        extract_transitive_python_dependencies(temporary_report)
+        os.replace(temporary_report, report_path)
+        temporary_report = None
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or '').strip()
+        message = f'Transitive Python dependency resolution failed (pip exit code {exc.returncode}).'
+        if details:
+            message = f'{message}\n{details}'
+        raise PythonDependencyResolutionError(message) from exc
+    except OSError as exc:
+        raise PythonDependencyResolutionError(
+            f'Transitive Python dependency resolution failed: {exc}'
+        ) from exc
+    finally:
+        for temporary_file in (requirements_filename, temporary_report):
+            if temporary_file and os.path.exists(temporary_file):
+                os.unlink(temporary_file)
+
+
+def extract_transitive_python_dependencies(report_path: str) -> list[str]:
+    """Return canonicalized transitive names from a pip installation report."""
+    try:
+        with open(report_path, 'r', encoding='utf-8') as report_file:
+            report = json.load(report_file)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise PythonDependencyResolutionError(
+            f'Unable to read pip installation report {report_path}: {exc}'
+        ) from exc
+
+    if not isinstance(report, dict):
+        raise PythonDependencyResolutionError('Invalid pip installation report: top-level value must be an object.')
+
+    install_entries = report.get('install')
+    if not isinstance(install_entries, list):
+        raise PythonDependencyResolutionError("Invalid pip installation report: 'install' must be a list.")
+
+    transitive_names = set()
+    for entry_number, item in enumerate(install_entries, start=1):
+        if not isinstance(item, dict):
+            raise PythonDependencyResolutionError(
+                f'Invalid pip installation report: install entry {entry_number} must be an object.'
+            )
+
+        metadata = item.get('metadata')
+        if not isinstance(metadata, dict):
+            raise PythonDependencyResolutionError(
+                f"Invalid pip installation report: install entry {entry_number} lacks valid 'metadata'."
+            )
+
+        name = metadata.get('name')
+        if not isinstance(name, str) or not PACKAGE_NAME_RE.fullmatch(name):
+            raise PythonDependencyResolutionError(
+                f"Invalid pip installation report: install entry {entry_number} lacks a valid 'metadata.name'."
+            )
+
+        requested = item.get('requested')
+        if not isinstance(requested, bool):
+            raise PythonDependencyResolutionError(
+                f"Invalid pip installation report: install entry {entry_number} has an invalid 'requested' value."
+            )
+
+        if requested is False:
+            transitive_names.add(canonicalize_name(name))
+
+    return sorted(transitive_names)
+
+
+def write_python_dependency_outputs(
+    requirements: list[str],
+    *,
+    report_path: str | None,
+    transitive_path: str | None,
+) -> None:
+    """Resolve once and write the requested report and transitive outputs."""
+    if report_path:
+        resolve_python_dependencies(requirements, report_path=report_path)
+        transitive_names = extract_transitive_python_dependencies(report_path)
+        if transitive_path:
+            write_file(transitive_path, transitive_names + [''] if transitive_names else [])
+        return
+
+    if transitive_path:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_report = os.path.join(temporary_directory, 'pip-report.json')
+            resolve_python_dependencies(requirements, report_path=temporary_report)
+            transitive_names = extract_transitive_python_dependencies(temporary_report)
+            write_file(transitive_path, transitive_names + [''] if transitive_names else [])
 
 
 def main():
