@@ -293,6 +293,43 @@ introspected collections to the specified file.
 
    $ ansible-builder introspect --write-bindep=bindep.txt /path/to/collections
 
+``--write-python-dependency-report``
+****************************************
+
+Resolve the final filtered Python requirements and write the installation report produced by pip without modification.
+The report includes both directly requested and transitive packages, including the concrete versions selected by pip.
+Its format is owned by pip and contains resolver environment, package metadata, download locations, and hashes where
+available. This option requires pip 22.2 or later in the Python environment running ``ansible-builder``.
+
+.. code:: console
+
+   $ ansible-builder introspect \
+       --write-python-dependency-report=python-dependencies.json \
+       /path/to/collections
+
+Resolution may access configured package indexes, direct URLs, or VCS sources. The result describes the environment in
+which ``introspect`` runs and may vary with the Python version, operating system, architecture, package indexes, index
+state, constraints, environment markers, and requested extras. If no Python requirements remain after filtering, pip is
+still invoked and its valid empty installation report is written.
+
+``--write-transitive-python``
+********************************
+
+Resolve the final filtered Python requirements and write only the names of packages introduced transitively by those
+requirements. Names are canonicalized, de-duplicated, and sorted, with one name per line. Versions, dependency edges,
+download metadata, hashes, and collection provenance are intentionally omitted. Direct collection and user requirements
+are not included. When no packages are resolved transitively, an empty file is written.
+
+.. code:: console
+
+   $ ansible-builder introspect \
+       --write-transitive-python=transitive-requirements.txt \
+       /path/to/collections
+
+pip still selects concrete versions to discover the dependency graph, so this option has the same network and
+environment-dependent behavior as ``--write-python-dependency-report`` and also requires pip 22.2 or later. The output
+is a convenience list and must not be treated as a lock file.
+
 ``--user-pip``
 **************
 
@@ -342,6 +379,39 @@ collection name (in the format ``namespace.name``) whose requirements should be 
 .. code::
 
    $ ansible-builder introspect --exclude-collection-reqs=collections-to-skip.txt /path/to/collections
+
+Combining Python dependency outputs
+*************************************
+
+The existing direct-requirements output and both resolved outputs can be requested together. pip resolves the filtered
+requirements only once when both resolved outputs are requested.
+
+.. code:: console
+
+   $ ansible-builder introspect \
+       --write-pip=direct-requirements.txt \
+       --write-python-dependency-report=python-dependencies.json \
+       --write-transitive-python=transitive-requirements.txt \
+       /path/to/collections
+
+The resulting files contain:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - File
+     - Contents
+   * - :file:`direct-requirements.txt`
+     - Existing declared and filtered requirements, with collection provenance comments.
+   * - :file:`python-dependencies.json`
+     - The unmodified pip installation report, including direct and transitive packages.
+   * - :file:`transitive-requirements.txt`
+     - Canonical, sorted, unpinned names of transitive packages only.
+
+These options do not change the YAML printed by ``introspect`` or the files produced by ``--write-pip`` and
+``--write-bindep``. Existing requirement exclusions and collection filters are applied before resolution. The structured
+pip report may support future dependency-analysis functionality, but these options do not generate an SBOM.
 
 .. note::
 
